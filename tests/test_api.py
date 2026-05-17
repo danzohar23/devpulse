@@ -1,4 +1,4 @@
-"""Tests for the FastAPI layer (Milestone 2)."""
+"""Tests for the FastAPI REST API (Milestone 2)."""
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
