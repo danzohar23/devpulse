@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
+UTC = timezone.utc
 
 from pulse.config import settings
 from pulse.db.engine import get_session, run_migrations

@@ -1,3 +1,4 @@
+"""Database access layer — all DB queries live here."""
 from __future__ import annotations
 
 from typing import Any
@@ -26,11 +27,9 @@ async def _insert_ignore(
     dialect_name = conn.dialect.name
     if dialect_name == "sqlite":
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
         stmt = sqlite_insert(model).values(**values).on_conflict_do_nothing()
     else:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
-
         stmt = pg_insert(model).values(**values).on_conflict_do_nothing(
             index_elements=conflict_cols
         )
@@ -116,11 +115,14 @@ async def get_recent_commits(
 async def get_recent_pull_requests(
     session: AsyncSession,
     repo: str | None = None,
+    state: str | None = None,
     limit: int = 50,
 ) -> list[PullRequest]:
     q = select(PullRequestRecord).order_by(PullRequestRecord.created_at.desc()).limit(limit)
     if repo is not None:
         q = q.where(PullRequestRecord.repo == repo)
+    if state is not None:
+        q = q.where(PullRequestRecord.state == state)
     rows = await session.scalars(q)
     return [
         PullRequest(
@@ -140,11 +142,14 @@ async def get_recent_pull_requests(
 async def get_recent_issues(
     session: AsyncSession,
     repo: str | None = None,
+    state: str | None = None,
     limit: int = 50,
 ) -> list[Issue]:
     q = select(IssueRecord).order_by(IssueRecord.created_at.desc()).limit(limit)
     if repo is not None:
         q = q.where(IssueRecord.repo == repo)
+    if state is not None:
+        q = q.where(IssueRecord.state == state)
     rows = await session.scalars(q)
     return [
         Issue(
