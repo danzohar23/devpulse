@@ -45,3 +45,11 @@ CREATE TABLE IF NOT EXISTS issues (
 
 CREATE INDEX IF NOT EXISTS issues_repo_idx       ON issues (repo);
 CREATE INDEX IF NOT EXISTS issues_created_at_idx ON issues (created_at DESC);
+
+-- HNSW vector indexes for cosine-distance ANN search (built after bulk load)
+CREATE INDEX IF NOT EXISTS commits_embedding_idx
+    ON commits USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS pull_requests_embedding_idx
+    ON pull_requests USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS issues_embedding_idx
+    ON issues USING hnsw (embedding vector_cosine_ops);

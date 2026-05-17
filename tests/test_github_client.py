@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timezone
-UTC = timezone.utc
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import httpx

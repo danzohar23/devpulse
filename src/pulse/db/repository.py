@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pulse.models import (
@@ -13,6 +13,7 @@ from pulse.models import (
     IssueRecord,
     PullRequest,
     PullRequestRecord,
+    SearchResult,
 )
 
 
@@ -68,6 +69,11 @@ async def _insert_update(
     await session.execute(stmt)
 
 
+# ---------------------------------------------------------------------------
+# Ingestion upserts
+# ---------------------------------------------------------------------------
+
+
 async def upsert_commit(session: AsyncSession, commit: Commit) -> None:
     await _insert_ignore(
         session,
@@ -121,6 +127,11 @@ async def upsert_issue(session: AsyncSession, issue: Issue) -> None:
         ["issue_id", "repo"],
         ["state", "closed_at"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Recent-record queries
+# ---------------------------------------------------------------------------
 
 
 async def get_recent_commits(
@@ -198,3 +209,221 @@ async def get_recent_issues(
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Embedding writes — called by the indexer after generating vectors
+# ---------------------------------------------------------------------------
+
+
+async def set_commit_embedding(
+    session: AsyncSession,
+    sha: str,
+    embedding: list[float],
+) -> None:
+    await session.execute(
+        update(CommitRecord).where(CommitRecord.sha == sha).values(embedding=embedding)
+    )
+
+
+async def set_pull_request_embedding(
+    session: AsyncSession,
+    pr_id: int,
+    repo: str,
+    embedding: list[float],
+) -> None:
+    await session.execute(
+        update(PullRequestRecord)
+        .where(PullRequestRecord.pr_id == pr_id, PullRequestRecord.repo == repo)
+        .values(embedding=embedding)
+    )
+
+
+async def set_issue_embedding(
+    session: AsyncSession,
+    issue_id: int,
+    repo: str,
+    embedding: list[float],
+) -> None:
+    await session.execute(
+        update(IssueRecord)
+        .where(IssueRecord.issue_id == issue_id, IssueRecord.repo == repo)
+        .values(embedding=embedding)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unindexed-record queries — used by the incremental indexer
+# ---------------------------------------------------------------------------
+
+
+async def get_unindexed_commits(
+    session: AsyncSession,
+    batch_size: int = 100,
+) -> list[Commit]:
+    q = (
+        select(CommitRecord)
+        .where(CommitRecord.embedding.is_(None))
+        .limit(batch_size)
+    )
+    rows = await session.scalars(q)
+    return [
+        Commit(
+            sha=r.sha,
+            repo=r.repo,
+            message=r.message,
+            author_name=r.author_name,
+            author_email=r.author_email,
+            timestamp=r.timestamp,
+            url=r.url,
+        )
+        for r in rows
+    ]
+
+
+async def get_unindexed_pull_requests(
+    session: AsyncSession,
+    batch_size: int = 100,
+) -> list[PullRequest]:
+    q = (
+        select(PullRequestRecord)
+        .where(PullRequestRecord.embedding.is_(None))
+        .limit(batch_size)
+    )
+    rows = await session.scalars(q)
+    return [
+        PullRequest(
+            pr_id=r.pr_id,
+            repo=r.repo,
+            title=r.title,
+            body=r.body,
+            state=r.state,
+            merged_at=r.merged_at,
+            created_at=r.created_at,
+            url=r.url,
+        )
+        for r in rows
+    ]
+
+
+async def get_unindexed_issues(
+    session: AsyncSession,
+    batch_size: int = 100,
+) -> list[Issue]:
+    q = (
+        select(IssueRecord)
+        .where(IssueRecord.embedding.is_(None))
+        .limit(batch_size)
+    )
+    rows = await session.scalars(q)
+    return [
+        Issue(
+            issue_id=r.issue_id,
+            repo=r.repo,
+            title=r.title,
+            body=r.body,
+            state=r.state,
+            created_at=r.created_at,
+            closed_at=r.closed_at,
+            url=r.url,
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Vector similarity search — PostgreSQL + pgvector only
+# ---------------------------------------------------------------------------
+
+def _vec_param(embedding: list[float]) -> str:
+    """Serialise a float list to the pgvector text literal format."""
+    return "[" + ",".join(str(x) for x in embedding) + "]"
+
+
+async def search_similar(
+    session: AsyncSession,
+    query_embedding: list[float],
+    limit: int = 10,
+    repo: str | None = None,
+) -> list[SearchResult]:
+    """Return the top-`limit` most semantically similar activity records.
+
+    Uses cosine distance via pgvector's <=> operator. Returns an empty list
+    when the underlying database is not PostgreSQL (e.g. during SQLite tests).
+    Each entity type contributes up to `limit` candidates; the final list is
+    re-ranked globally and trimmed to `limit`.
+    """
+    conn = await session.connection()
+    if conn.dialect.name != "postgresql":
+        return []
+
+    vec = _vec_param(query_embedding)
+    repo_filter = "AND repo = :repo" if repo is not None else ""
+    params: dict[str, Any] = {"vec": vec, "n": limit}
+    if repo is not None:
+        params["repo"] = repo
+
+    commit_sql = text(f"""
+        SELECT 'commit'        AS type,
+               1 - (embedding <=> CAST(:vec AS vector)) AS score,
+               repo,
+               url,
+               message         AS title,
+               NULL            AS body,
+               NULL            AS state,
+               timestamp       AS created_at
+        FROM   commits
+        WHERE  embedding IS NOT NULL {repo_filter}
+        ORDER BY embedding <=> CAST(:vec AS vector)
+        LIMIT  :n
+    """)
+
+    pr_sql = text(f"""
+        SELECT 'pull_request'  AS type,
+               1 - (embedding <=> CAST(:vec AS vector)) AS score,
+               repo,
+               url,
+               title,
+               body,
+               state,
+               created_at
+        FROM   pull_requests
+        WHERE  embedding IS NOT NULL {repo_filter}
+        ORDER BY embedding <=> CAST(:vec AS vector)
+        LIMIT  :n
+    """)
+
+    issue_sql = text(f"""
+        SELECT 'issue'         AS type,
+               1 - (embedding <=> CAST(:vec AS vector)) AS score,
+               repo,
+               url,
+               title,
+               body,
+               state,
+               created_at
+        FROM   issues
+        WHERE  embedding IS NOT NULL {repo_filter}
+        ORDER BY embedding <=> CAST(:vec AS vector)
+        LIMIT  :n
+    """)
+
+    results: list[SearchResult] = []
+    for sql in (commit_sql, pr_sql, issue_sql):
+        rows = (await session.execute(sql, params)).mappings().all()
+        for r in rows:
+            results.append(
+                SearchResult(
+                    type=r["type"],
+                    score=float(r["score"]),
+                    repo=r["repo"],
+                    url=r["url"],
+                    title=r["title"],
+                    body=r["body"],
+                    state=r["state"],
+                    created_at=r["created_at"],
+                )
+            )
+
+    results.sort(key=lambda x: x.score, reverse=True)
+    return results[:limit]

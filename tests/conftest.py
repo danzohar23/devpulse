@@ -8,6 +8,7 @@ os.environ.setdefault("GITHUB_TOKEN", "ghp_test_token")
 os.environ.setdefault("GITHUB_USERNAME", "testuser")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test-key")
+os.environ.setdefault("OPENAI_API_KEY", "sk-test-openai-key")
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager

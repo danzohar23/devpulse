@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     github_username: str
     database_url: str
     anthropic_api_key: str
+    openai_api_key: str
     # Comma-separated list of "owner/repo" strings; empty means ingest all user repos
     github_repos: str = ""
 
