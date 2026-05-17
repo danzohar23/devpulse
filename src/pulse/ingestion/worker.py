@@ -9,6 +9,8 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
+import httpx
+
 from pulse.config import settings
 from pulse.db.engine import get_session, run_migrations
 from pulse.db.repository import upsert_commit, upsert_issue, upsert_pull_request
@@ -21,6 +23,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 LOOKBACK_DAYS = 30
+
+# HTTP status codes that indicate the token itself is broken, not a per-repo
+# problem.  We abort immediately rather than hammering every subsequent repo
+# with calls that will also fail.
+_FATAL_STATUS_CODES = frozenset({401, 403, 429})
+
+
+def _is_fatal(exc: httpx.HTTPStatusError) -> bool:
+    """Return True when the error cannot be resolved by skipping to the next repo."""
+    return exc.response.status_code in _FATAL_STATUS_CODES
 
 
 async def ingest_repo(repo: str, since: datetime, client: GitHubClient) -> None:
@@ -58,8 +70,23 @@ async def main() -> None:
         for repo in repos:
             try:
                 await ingest_repo(repo, since, client)
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status in (401, 403):
+                    logger.critical(
+                        "GitHub token is invalid or lacks permissions (HTTP %d) — aborting",
+                        status,
+                    )
+                    raise
+                if status == 429:
+                    logger.critical(
+                        "Rate limit exhausted after all retries (HTTP 429) — aborting; "
+                        "remaining repos will not be ingested",
+                    )
+                    raise
+                logger.exception("Failed to ingest %s — skipping", repo)
             except Exception:
-                logger.exception("Failed to ingest %s", repo)
+                logger.exception("Failed to ingest %s — skipping", repo)
 
     logger.info("Ingestion complete")
 
