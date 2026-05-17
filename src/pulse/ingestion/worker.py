@@ -7,8 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
-UTC = timezone.utc
+from datetime import UTC, datetime, timedelta
 
 from pulse.config import settings
 from pulse.db.engine import get_session, run_migrations
@@ -27,21 +26,18 @@ LOOKBACK_DAYS = 30
 async def ingest_repo(repo: str, since: datetime, client: GitHubClient) -> None:
     logger.info("Ingesting %s since %s", repo, since.date())
 
+    # Fetch all data before opening a DB session so no connection is held
+    # open during network I/O.
     commits = client.get_commits(repo, since)
-    logger.info("  %d commits", len(commits))
+    prs = client.get_pull_requests(repo, since)
+    issues = client.get_issues(repo, since)
+    logger.info("  %d commits, %d PRs, %d issues", len(commits), len(prs), len(issues))
+
     async with get_session() as session:
         for commit in commits:
             await upsert_commit(session, commit)
-
-    prs = client.get_pull_requests(repo, since)
-    logger.info("  %d pull requests", len(prs))
-    async with get_session() as session:
         for pr in prs:
             await upsert_pull_request(session, pr)
-
-    issues = client.get_issues(repo, since)
-    logger.info("  %d issues", len(issues))
-    async with get_session() as session:
         for issue in issues:
             await upsert_issue(session, issue)
 

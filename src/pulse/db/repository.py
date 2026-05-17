@@ -27,11 +27,43 @@ async def _insert_ignore(
     dialect_name = conn.dialect.name
     if dialect_name == "sqlite":
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
         stmt = sqlite_insert(model).values(**values).on_conflict_do_nothing()
     else:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
+
         stmt = pg_insert(model).values(**values).on_conflict_do_nothing(
             index_elements=conflict_cols
+        )
+    await session.execute(stmt)
+
+
+async def _insert_update(
+    session: AsyncSession,
+    model: Any,
+    values: dict[str, Any],
+    conflict_cols: list[str],
+    update_cols: list[str],
+) -> None:
+    """Dialect-aware INSERT ... ON CONFLICT DO UPDATE on the specified columns."""
+    conn = await session.connection()
+    dialect_name = conn.dialect.name
+    update_set = {col: values[col] for col in update_cols}
+    if dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        stmt = (
+            sqlite_insert(model)
+            .values(**values)
+            .on_conflict_do_update(index_elements=conflict_cols, set_=update_set)
+        )
+    else:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        stmt = (
+            pg_insert(model)
+            .values(**values)
+            .on_conflict_do_update(index_elements=conflict_cols, set_=update_set)
         )
     await session.execute(stmt)
 
@@ -54,7 +86,7 @@ async def upsert_commit(session: AsyncSession, commit: Commit) -> None:
 
 
 async def upsert_pull_request(session: AsyncSession, pr: PullRequest) -> None:
-    await _insert_ignore(
+    await _insert_update(
         session,
         PullRequestRecord,
         {
@@ -68,11 +100,12 @@ async def upsert_pull_request(session: AsyncSession, pr: PullRequest) -> None:
             "url": pr.url,
         },
         ["pr_id", "repo"],
+        ["state", "merged_at"],
     )
 
 
 async def upsert_issue(session: AsyncSession, issue: Issue) -> None:
-    await _insert_ignore(
+    await _insert_update(
         session,
         IssueRecord,
         {
@@ -86,6 +119,7 @@ async def upsert_issue(session: AsyncSession, issue: Issue) -> None:
             "url": issue.url,
         },
         ["issue_id", "repo"],
+        ["state", "closed_at"],
     )
 
 
