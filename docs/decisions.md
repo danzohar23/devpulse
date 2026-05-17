@@ -53,3 +53,13 @@
 **Decision**: The FastAPI `lifespan` hook does not call `run_migrations()`. Schema setup is the responsibility of the worker or a dedicated migration step, not the API process.
 
 **Why**: Running DDL at API startup is risky in multi-replica deployments (concurrent migrations, lock contention). It also obscures whether a migration succeeded or failed. Keeping migrations explicit — run once by the worker or a separate CLI step — makes the behaviour predictable and easy to verify in CI.
+
+## ADR-010: Sync/async architecture split
+
+**Decision**: The API and database layer are fully async (FastAPI, SQLAlchemy async engine, `AsyncSession`). The ingestion worker is a synchronous, sequential script that uses a sync `httpx.Client`. The worker's async shell (`ingest_repo`, `main`) is driven by a single `asyncio.run()` call at the entry point, which is the only place an event loop is created.
+
+**Why — API must be async**: FastAPI runs on an ASGI server (uvicorn). Handling concurrent HTTP requests without blocking requires async I/O throughout: from the route handler down through the database session. A sync SQLAlchemy session inside an async route would block the event loop during every query, serialising all requests and defeating the purpose of an async server.
+
+**Why — worker stays sync**: The ingestion worker is a single-process, sequential job: fetch commits → fetch PRs → fetch issues → write to DB → repeat for the next repo. There is no concurrency to exploit. Making the GitHub client async would require `async with httpx.AsyncClient()`, async retry logic, and running inside an already-active event loop — complexity that yields no throughput benefit for a rate-limited, sequential workload.
+
+**Why `asyncio.run()` is safe here**: The worker calls `asyncio.run(main())` once at startup. `asyncio.run` creates a fresh event loop, runs the coroutine to completion, and shuts the loop down before returning. The sync GitHub client is called *between* awaits — specifically, all network I/O finishes before `async with get_session()` opens — so the blocking `httpx` calls never execute inside a running event loop. This is the correct pattern: sync blocking work happens outside the async context; the async context is only entered for database writes. The alternative — running the sync client inside `asyncio.get_event_loop().run_in_executor()` — would be necessary only if the worker were embedded in a long-lived async service that needed to remain responsive while waiting on the GitHub API.
