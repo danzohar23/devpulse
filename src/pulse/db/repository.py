@@ -348,14 +348,19 @@ async def search_similar(
 ) -> list[SearchResult]:
     """Return the top-`limit` most semantically similar activity records.
 
-    Uses cosine distance via pgvector's <=> operator. Returns an empty list
-    when the underlying database is not PostgreSQL (e.g. during SQLite tests).
-    Each entity type contributes up to `limit` candidates; the final list is
-    re-ranked globally and trimmed to `limit`.
+    Uses cosine distance via pgvector's <=> operator. Each entity type
+    contributes up to `limit` candidates; the final list is re-ranked
+    globally and trimmed to `limit`.
+
+    Raises:
+        NotImplementedError: when the underlying database is not PostgreSQL
+            (pgvector operators are unavailable on other backends).
     """
     conn = await session.connection()
     if conn.dialect.name != "postgresql":
-        return []
+        raise NotImplementedError(
+            "search_similar requires PostgreSQL with pgvector — SQLite is not supported"
+        )
 
     vec = _vec_param(query_embedding)
     repo_filter = "AND repo = :repo" if repo is not None else ""

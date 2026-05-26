@@ -276,14 +276,14 @@ async def test_get_unindexed_issues_returns_only_null_embedding(
 
 
 # ---------------------------------------------------------------------------
-# search_similar — returns [] on SQLite (pgvector operators unavailable)
+# search_similar — raises NotImplementedError on non-PostgreSQL backends
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_search_similar_returns_empty_on_sqlite(db_session: AsyncSession) -> None:
-    results = await search_similar(db_session, _FAKE_VEC, limit=5)
-    assert results == []
+async def test_search_similar_raises_on_sqlite(db_session: AsyncSession) -> None:
+    with pytest.raises(NotImplementedError, match="search_similar requires PostgreSQL"):
+        await search_similar(db_session, _FAKE_VEC, limit=5)
 
 
 # ---------------------------------------------------------------------------

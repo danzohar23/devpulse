@@ -24,17 +24,18 @@
 - `embed_texts()` — OpenAI `text-embedding-3-small`, batched in groups of 100
 - Incremental indexer (`python -m pulse.indexing.indexer`) — fetches unindexed records, embeds, writes back; DB connection closed during network I/O
 - Repository functions: `get_unindexed_*`, `set_*_embedding`, `search_similar`
-- `search_similar` — cosine distance via pgvector `<=>`, searches all three tables, re-ranks globally; returns `[]` on non-PostgreSQL (safe for tests)
+- `search_similar` — cosine distance via pgvector `<=>`, searches all three tables, re-ranks globally; raises `NotImplementedError` on non-PostgreSQL (ADR-013)
 - HNSW indexes in `schema.sql` (`vector_cosine_ops`)
 
-## Milestone 3: MCP server (TODO)
-- Initialise `mcp.Server` with stdio transport
-- Register tools (all call repository layer, never the DB directly):
-  - `search_activity(query: str, since: str, repo: str | None) -> list[dict]` — embeds query, calls `search_similar`
-  - `get_commits(repo: str, limit: int) -> list[dict]`
-  - `get_pull_requests(repo: str, state: str, limit: int) -> list[dict]`
-  - `get_issues(repo: str, state: str, limit: int) -> list[dict]`
-- Tool tests in `tests/test_mcp_tools.py`
+## Milestone 3: MCP server ✅
+- `mcp.Server` initialised with stdio transport (`python -m pulse.mcp.server`)
+- Four tools, all calling repository layer only (ADR-001 / ADR-004):
+  - `search_activity(query, repo?, limit)` — embeds query with `embed_texts`, calls `search_similar`
+  - `get_commits(repo?, limit)` — calls `get_recent_commits`
+  - `get_pull_requests(repo?, state?, limit)` — calls `get_recent_pull_requests`
+  - `get_issues(repo?, state?, limit)` — calls `get_recent_issues`
+- Business logic extracted into `tool_*` module-level functions for direct testability
+- 15 tests in `tests/test_mcp_tools.py`; `search_activity` tests mock `embed_texts` + `search_similar`
 
 ## Milestone 4: Agent (TODO)
 - Claude tool-use loop (`claude-sonnet-4-6`) calling MCP tools

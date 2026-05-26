@@ -71,3 +71,17 @@
 **Why**: A broad `except Exception: log and continue` is wrong for token failures. If the GitHub token is invalid or lacks `repo` scope, every subsequent API call will return 401. Silently skipping all repos and exiting cleanly creates a false impression of success — operators see "Ingestion complete" in the logs and no data moves. The same argument applies to a 429 that has survived all tenacity retries: if the rate limit is truly exhausted, every remaining repo will hit the same wall within milliseconds. Continuing wastes connection overhead and produces a log full of identical failures. Aborting immediately makes the failure mode unambiguous and easy to alert on.
 
 **How to apply**: `httpx.HTTPStatusError` is caught first. Status 401 or 403 → log `CRITICAL` + re-raise. Status 429 → log `CRITICAL` + re-raise (tenacity only surfaces this after all retry attempts are spent). Any other `HTTPStatusError` (e.g. 404 for a deleted repo, 422, transient 5xx that slip through) → log `ERROR` + skip. All non-HTTP exceptions (DB errors, parse errors) → log `ERROR` + skip, so a broken repo does not kill the whole run.
+
+## ADR-012: Embedding model changes require a full re-index
+
+**Decision**: Switching the embedding model (currently `text-embedding-3-small`) mid-project is a breaking change that requires re-indexing every record. The new model must be rolled out in a dedicated migration step: clear all existing embeddings, run the incremental indexer to completion, then deploy the new code.
+
+**Why**: Embeddings from different models live in incompletely different spaces. Even when two models share the same output dimension (e.g. both produce 1536-dimensional vectors), their coordinate systems are unrelated — a cosine distance computed between a vector from model A and a vector from model B is meaningless. Mixing old and new embeddings in the same table will corrupt `search_similar` results silently: queries will match by numerical coincidence rather than semantic similarity, and the degradation is invisible in the application logs.
+
+**How to apply**: Before changing `_MODEL` in `embedder.py`, run a migration that sets `embedding = NULL` on every row in `commits`, `pull_requests`, and `issues`. Then run the indexer with the new model. Do not deploy the new `_MODEL` value while any rows still hold embeddings from the old model. Treat any commit that changes `_MODEL` as a migration commit — increment the schema version and document it in this file.
+
+## ADR-013: `search_similar` raises `NotImplementedError` on non-PostgreSQL backends
+
+**Decision**: `search_similar` raises `NotImplementedError` with a clear message when the underlying database is not PostgreSQL. It does not silently return an empty list.
+
+**Why**: Silent degradation is a trap. Returning `[]` on SQLite was convenient for running the test suite, but it means any caller on a non-PostgreSQL backend gets a plausible-looking "no results" response rather than an immediate, unambiguous error. A caller that doesn't know the function is a no-op on its backend will make wrong decisions — the agent would confidently report "nothing found" rather than "this feature is unavailable." Raising `NotImplementedError` makes the constraint visible at the call site and forces callers (including tests) to be explicit: either mock the function, skip the test, or run against a real PostgreSQL instance. The test that previously asserted `results == []` on SQLite has been updated to assert that the error is raised instead.
