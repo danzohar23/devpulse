@@ -22,6 +22,7 @@ from pulse.db.repository import (
     upsert_pull_request,
 )
 from pulse.mcp.server import (
+    call_tool,
     tool_get_commits,
     tool_get_issues,
     tool_get_pull_requests,
@@ -291,10 +292,7 @@ async def test_tool_search_activity_passes_repo_filter(db_session: AsyncSession)
     ):
         await tool_search_activity(db_session, query="bug", repo="owner/repo", limit=3)
 
-    mock_search.assert_called_once()
-    _, kwargs = mock_search.call_args
-    assert kwargs.get("repo") == "owner/repo"
-    assert kwargs.get("limit") == 3
+    mock_search.assert_called_once_with(db_session, _FAKE_VEC, limit=3, repo="owner/repo")
 
 
 @pytest.mark.asyncio
@@ -332,3 +330,44 @@ async def test_tool_search_activity_returns_dicts(db_session: AsyncSession) -> N
     assert "score" in result[0]
     assert "repo" in result[0]
     assert "url" in result[0]
+
+
+# ---------------------------------------------------------------------------
+# call_tool error handling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_tool_returns_error_text_on_not_implemented(
+    db_session: AsyncSession,
+) -> None:
+    """call_tool catches NotImplementedError from search_similar and returns an error TextContent.
+
+    This exercises the pgvector-unavailable path that real callers would hit on
+    a non-PostgreSQL backend (ADR-013).
+    """
+    from contextlib import asynccontextmanager
+    from typing import Any
+
+    def make_ctx() -> Any:
+        @asynccontextmanager
+        async def _ctx():  # type: ignore[return]
+            yield db_session
+        return _ctx()
+
+    with (
+        patch("pulse.mcp.server.get_session", side_effect=make_ctx),
+        patch("pulse.mcp.server.embed_texts", return_value=[_FAKE_VEC]),
+        patch(
+            "pulse.mcp.server.search_similar",
+            new_callable=AsyncMock,
+            side_effect=NotImplementedError("search_similar requires PostgreSQL"),
+        ),
+    ):
+        response = await call_tool("search_activity", {"query": "test"})
+
+    assert len(response) == 1
+    assert "Error" in response[0].text
+    assert "PostgreSQL" in response[0].text
+    # Must not be the generic internal-error message
+    assert "internal server error" not in response[0].text

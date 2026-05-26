@@ -51,7 +51,8 @@ async def tool_search_activity(
     limit: int = 10,
 ) -> list[dict]:
     """Embed *query* and return the most semantically similar activity records."""
-    embeddings = embed_texts([query])
+    loop = asyncio.get_running_loop()
+    embeddings = await loop.run_in_executor(None, embed_texts, [query])
     results = await search_similar(session, embeddings[0], limit=limit, repo=repo)
     return [r.model_dump(mode="json") for r in results]
 
@@ -193,38 +194,58 @@ async def list_tools() -> list[types.Tool]:
     ]
 
 
+def _clamp_limit(raw: object, default: int) -> int:
+    """Parse and clamp a raw limit value to [1, 200]."""
+    return max(1, min(200, int(raw if raw is not None else default)))
+
+
 @_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-    async with get_session() as session:
-        if name == "search_activity":
-            result = await tool_search_activity(
-                session,
-                query=arguments["query"],
-                repo=arguments.get("repo"),
-                limit=int(arguments.get("limit", 10)),
+    try:
+        async with get_session() as session:
+            if name == "search_activity":
+                limit = _clamp_limit(arguments.get("limit"), 10)
+                result = await tool_search_activity(
+                    session,
+                    query=arguments["query"],
+                    repo=arguments.get("repo"),
+                    limit=limit,
+                )
+            elif name == "get_commits":
+                limit = _clamp_limit(arguments.get("limit"), 50)
+                result = await tool_get_commits(
+                    session,
+                    repo=arguments.get("repo"),
+                    limit=limit,
+                )
+            elif name == "get_pull_requests":
+                limit = _clamp_limit(arguments.get("limit"), 50)
+                result = await tool_get_pull_requests(
+                    session,
+                    repo=arguments.get("repo"),
+                    state=arguments.get("state"),
+                    limit=limit,
+                )
+            elif name == "get_issues":
+                limit = _clamp_limit(arguments.get("limit"), 50)
+                result = await tool_get_issues(
+                    session,
+                    repo=arguments.get("repo"),
+                    state=arguments.get("state"),
+                    limit=limit,
+                )
+            else:
+                raise ValueError(f"Unknown tool: {name!r}")
+    except NotImplementedError:
+        return [
+            types.TextContent(
+                type="text",
+                text="Error: this tool requires PostgreSQL with pgvector",
             )
-        elif name == "get_commits":
-            result = await tool_get_commits(
-                session,
-                repo=arguments.get("repo"),
-                limit=int(arguments.get("limit", 50)),
-            )
-        elif name == "get_pull_requests":
-            result = await tool_get_pull_requests(
-                session,
-                repo=arguments.get("repo"),
-                state=arguments.get("state"),
-                limit=int(arguments.get("limit", 50)),
-            )
-        elif name == "get_issues":
-            result = await tool_get_issues(
-                session,
-                repo=arguments.get("repo"),
-                state=arguments.get("state"),
-                limit=int(arguments.get("limit", 50)),
-            )
-        else:
-            raise ValueError(f"Unknown tool: {name!r}")
+        ]
+    except Exception:
+        logger.exception("Unhandled error in call_tool for %r", name)
+        return [types.TextContent(type="text", text="Error: internal server error")]
 
     return [types.TextContent(type="text", text=json.dumps(result))]
 
