@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -76,9 +77,16 @@ Rules:
 @asynccontextmanager
 async def mcp_session() -> AsyncIterator[ClientSession]:
     """Spawn the MCP server as a subprocess and yield an initialised client session."""
+    # PYTHONUNBUFFERED=1 disables stdout block-buffering in the subprocess.
+    # Without it, the MCP server's JSON-RPC frames can sit in the child's
+    # stdout buffer indefinitely (Python buffers when stdout is a pipe rather
+    # than a TTY) and the agent appears to hang waiting for a response that
+    # has already been written. The current environment is forwarded so the
+    # subprocess inherits DATABASE_URL, OPENAI_API_KEY, etc.
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "pulse.mcp.server"],
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
