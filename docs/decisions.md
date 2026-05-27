@@ -85,3 +85,23 @@
 **Decision**: `search_similar` raises `NotImplementedError` with a clear message when the underlying database is not PostgreSQL. It does not silently return an empty list.
 
 **Why**: Silent degradation is a trap. Returning `[]` on SQLite was convenient for running the test suite, but it means any caller on a non-PostgreSQL backend gets a plausible-looking "no results" response rather than an immediate, unambiguous error. A caller that doesn't know the function is a no-op on its backend will make wrong decisions — the agent would confidently report "nothing found" rather than "this feature is unavailable." Raising `NotImplementedError` makes the constraint visible at the call site and forces callers (including tests) to be explicit: either mock the function, skip the test, or run against a real PostgreSQL instance. The test that previously asserted `results == []` on SQLite has been updated to assert that the error is raised instead.
+
+## ADR-014: Agent talks to the MCP server over stdio, not via direct import
+
+**Decision part 1**: The agent in `src/pulse/agent/agent.py` spawns `pulse.mcp.server` as a subprocess using the MCP Python SDK's `stdio_client` and communicates with it via the MCP wire protocol. It does **not** import the server's tool functions and call them in-process, even though both modules live in the same package.
+
+**Why subprocess**: ADR-004 declared MCP as the boundary between the agent and the data layer. Honouring that boundary at the *runtime* level — not just the API level — has three concrete benefits:
+
+1. **No drift between tested and shipped behaviour.** A third-party client (Claude Desktop, a future hosted runtime, another agent on the same network) would reach the tools over stdio. If the agent in this repo took a shortcut and imported the tool functions directly, the agent's call path would diverge from every other client's call path. Schema mismatches, serialisation bugs, and protocol-level errors would only show up in production. Routing through the same subprocess that other clients use guarantees the agent exercises the actual wire format.
+2. **Dependency isolation.** The agent process needs Anthropic + the MCP client. The server process needs SQLAlchemy, pgvector, OpenAI, and the GitHub client. Keeping them in separate processes means a tool dependency upgrade (e.g. a SQLAlchemy major version bump) cannot break the agent's startup, and a crash in a tool handler cannot take down the agent loop.
+3. **Faithful to MCP's design.** MCP is a wire protocol with a transport layer. Using `Server.run(read_stream, write_stream, ...)` only to then bypass the streams in tests would mean we're not actually testing the protocol surface — we'd be testing a Python function call wearing an MCP costume.
+
+**Decision part 2**: The system prompt instructs the agent to **always use tools to ground its answers** and to refuse to answer from memory.
+
+**Why no-memory**: The agent's job is to answer questions about the user's *private* GitHub activity. That data is not in Claude's training set and cannot be in Claude's training set — by definition it post-dates training and belongs to one user. Any answer "from memory" is therefore not memory at all; it is a hallucination dressed up as a plausible-sounding summary of what a typical developer might do. Three concrete failure modes the no-memory rule prevents:
+
+- *"Confident wrong"*: Claude could plausibly say "you opened three PRs about authentication last week" because that pattern is common in training data. Without a tool call, that sentence has no truth value. The user can't tell.
+- *"Soft refusal that looks like data"*: Claude could say "I don't see much activity around X" without ever having queried. The user reads this as "no activity found" instead of "no query was run."
+- *"Backed-into-a-corner hedging"*: Asked a question whose tool path is unclear (e.g. an aggregation the tools don't directly support), Claude might invent an estimate rather than admit the gap. With the no-memory rule, the model is forced either to compose a tool call that *does* answer the question or to say plainly that the tools don't cover it.
+
+The rule also doubles as a debugging aid: every meaningful answer corresponds to a tool call visible in the INFO logs. An answer with no tool call in the logs is, by policy, a bug.
