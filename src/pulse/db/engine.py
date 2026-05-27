@@ -38,7 +38,17 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def run_migrations() -> None:
-    """Execute schema.sql against the configured database."""
+    """Execute schema.sql against the configured database.
+
+    asyncpg's prepared-statement API rejects multi-statement strings, so we
+    split the file on ``;`` and run each statement individually. The schema
+    is plain DDL with no dollar-quoted bodies or string literals containing
+    semicolons, so a simple split is safe here.
+    """
     sql = importlib.resources.files("pulse.db").joinpath("schema.sql").read_text()
     async with _engine.begin() as conn:
-        await conn.exec_driver_sql(sql)
+        for raw_stmt in sql.split(";"):
+            stmt = raw_stmt.strip()
+            if not stmt:
+                continue
+            await conn.exec_driver_sql(stmt)
