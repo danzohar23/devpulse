@@ -59,12 +59,16 @@ def _mcp_tool(
 def _make_clients(
     *,
     claude_responses: list,
-    mcp_tools: list,
     mcp_call_results: list | None = None,
 ) -> tuple[Any, Any]:
-    """Build matching mock anthropic_client and mcp_client pairs."""
+    """Build matching mock anthropic_client and mcp_client pairs.
+
+    Note: ``list_tools`` is mocked but should *never* be called from
+    ``run_agent_turn`` — the tool catalogue is now passed in as an argument
+    (fetched once per session in ``chat``).
+    """
     mcp_client = MagicMock()
-    mcp_client.list_tools = AsyncMock(return_value=SimpleNamespace(tools=mcp_tools))
+    mcp_client.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
     if mcp_call_results is None:
         mcp_client.call_tool = AsyncMock()
     else:
@@ -75,6 +79,17 @@ def _make_clients(
     anthropic_client.messages.create = AsyncMock(side_effect=claude_responses)
 
     return anthropic_client, mcp_client
+
+
+# Pre-converted Anthropic tool catalogue used by most tests. Mirrors what
+# chat() would produce from the MCP server's list_tools result.
+_DEFAULT_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "get_commits",
+        "description": "Recent commits",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+]
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +136,9 @@ async def test_no_tool_call_returns_text_and_exits() -> None:
         claude_responses=[
             _claude_response([_text_block("hello there")], stop_reason="end_turn"),
         ],
-        mcp_tools=[_mcp_tool()],
     )
 
-    result = await run_agent_turn("hi", anthropic_client, mcp_client)
+    result = await run_agent_turn("hi", _DEFAULT_TOOLS, anthropic_client, mcp_client)
 
     assert result == "hello there"
     mcp_client.call_tool.assert_not_called()
@@ -142,11 +156,12 @@ async def test_tool_use_block_is_routed_to_mcp_client() -> None:
             ),
             _claude_response([_text_block("Found 1 commit.")], stop_reason="end_turn"),
         ],
-        mcp_tools=[_mcp_tool("get_commits")],
         mcp_call_results=[_mcp_call_result('[{"sha":"abc"}]')],
     )
 
-    result = await run_agent_turn("show me commits", anthropic_client, mcp_client)
+    result = await run_agent_turn(
+        "show me commits", _DEFAULT_TOOLS, anthropic_client, mcp_client
+    )
 
     assert result == "Found 1 commit."
     mcp_client.call_tool.assert_called_once_with("get_commits", {"limit": 5})
@@ -163,11 +178,10 @@ async def test_tool_result_is_passed_back_to_claude() -> None:
             ),
             _claude_response([_text_block("Done.")], stop_reason="end_turn"),
         ],
-        mcp_tools=[_mcp_tool()],
         mcp_call_results=[_mcp_call_result('[{"sha":"abc"}]')],
     )
 
-    await run_agent_turn("show me commits", anthropic_client, mcp_client)
+    await run_agent_turn("show me commits", _DEFAULT_TOOLS, anthropic_client, mcp_client)
 
     # Inspect the messages payload of the *second* Anthropic call.
     second_call = anthropic_client.messages.create.call_args_list[1]
@@ -189,28 +203,23 @@ async def test_tool_result_is_passed_back_to_claude() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_tools_are_forwarded_to_claude() -> None:
-    """The MCP tool catalogue is converted and passed in the tools= kwarg."""
-    mcp_tool = _mcp_tool(
-        name="search_activity",
-        description="Semantic search",
-        schema={"type": "object", "properties": {"query": {"type": "string"}}},
-    )
-    anthropic_client, mcp_client = _make_clients(
-        claude_responses=[_claude_response([_text_block("ok")], stop_reason="end_turn")],
-        mcp_tools=[mcp_tool],
-    )
-
-    await run_agent_turn("hello", anthropic_client, mcp_client)
-
-    sent_tools = anthropic_client.messages.create.call_args.kwargs["tools"]
-    assert sent_tools == [
+async def test_tools_argument_is_forwarded_to_claude() -> None:
+    """The pre-converted tool catalogue passed in is forwarded verbatim to Claude."""
+    tools: list[dict[str, Any]] = [
         {
             "name": "search_activity",
             "description": "Semantic search",
             "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
         }
     ]
+    anthropic_client, mcp_client = _make_clients(
+        claude_responses=[_claude_response([_text_block("ok")], stop_reason="end_turn")],
+    )
+
+    await run_agent_turn("hello", tools, anthropic_client, mcp_client)
+
+    sent_tools = anthropic_client.messages.create.call_args.kwargs["tools"]
+    assert sent_tools == tools
 
 
 @pytest.mark.asyncio
@@ -228,14 +237,13 @@ async def test_multiple_tool_use_rounds() -> None:
             ),
             _claude_response([_text_block("Summary done.")], stop_reason="end_turn"),
         ],
-        mcp_tools=[_mcp_tool()],
         mcp_call_results=[
             _mcp_call_result("commits-payload"),
             _mcp_call_result("issues-payload"),
         ],
     )
 
-    result = await run_agent_turn("summarise", anthropic_client, mcp_client)
+    result = await run_agent_turn("summarise", _DEFAULT_TOOLS, anthropic_client, mcp_client)
 
     assert result == "Summary done."
     assert mcp_client.call_tool.call_count == 2
@@ -261,11 +269,10 @@ async def test_parallel_tool_calls_in_one_response() -> None:
             ),
             _claude_response([_text_block("Done.")], stop_reason="end_turn"),
         ],
-        mcp_tools=[_mcp_tool()],
         mcp_call_results=[_mcp_call_result("c-out"), _mcp_call_result("i-out")],
     )
 
-    await run_agent_turn("multi", anthropic_client, mcp_client)
+    await run_agent_turn("multi", _DEFAULT_TOOLS, anthropic_client, mcp_client)
 
     assert mcp_client.call_tool.call_count == 2
     second_messages = anthropic_client.messages.create.call_args_list[1].kwargs["messages"]
@@ -293,7 +300,7 @@ async def test_tool_call_failure_returned_as_is_error() -> None:
         ]
     )
 
-    result = await run_agent_turn("try", anthropic_client, mcp_client)
+    result = await run_agent_turn("try", _DEFAULT_TOOLS, anthropic_client, mcp_client)
 
     assert result == "recovered"
     second_messages = anthropic_client.messages.create.call_args_list[1].kwargs["messages"]
@@ -313,13 +320,49 @@ async def test_logs_tool_calls_at_info_level(caplog: pytest.LogCaptureFixture) -
             ),
             _claude_response([_text_block("ok")], stop_reason="end_turn"),
         ],
-        mcp_tools=[_mcp_tool()],
         mcp_call_results=[_mcp_call_result("payload")],
     )
 
     with caplog.at_level("INFO", logger="pulse.agent.agent"):
-        await run_agent_turn("hi", anthropic_client, mcp_client)
+        await run_agent_turn("hi", _DEFAULT_TOOLS, anthropic_client, mcp_client)
 
     log_text = "\n".join(rec.getMessage() for rec in caplog.records)
     assert "Tool call: get_commits" in log_text
     assert "Tool result for get_commits" in log_text
+
+
+# ---------------------------------------------------------------------------
+# Tool catalogue is fetched in chat(), not in run_agent_turn
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_agent_turn_does_not_call_list_tools() -> None:
+    """run_agent_turn must not refetch the catalogue — chat() does it once per session."""
+    anthropic_client, mcp_client = _make_clients(
+        claude_responses=[_claude_response([_text_block("ok")], stop_reason="end_turn")],
+    )
+
+    await run_agent_turn("hi", _DEFAULT_TOOLS, anthropic_client, mcp_client)
+
+    mcp_client.list_tools.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_tools_not_called_across_multiple_turns() -> None:
+    """Across N turns in the same session, list_tools fires zero times from the loop."""
+    anthropic_client, mcp_client = _make_clients(
+        claude_responses=[
+            _claude_response([_text_block("first")], stop_reason="end_turn"),
+            _claude_response([_text_block("second")], stop_reason="end_turn"),
+            _claude_response([_text_block("third")], stop_reason="end_turn"),
+        ],
+    )
+
+    await run_agent_turn("q1", _DEFAULT_TOOLS, anthropic_client, mcp_client)
+    await run_agent_turn("q2", _DEFAULT_TOOLS, anthropic_client, mcp_client)
+    await run_agent_turn("q3", _DEFAULT_TOOLS, anthropic_client, mcp_client)
+
+    mcp_client.list_tools.assert_not_called()
+    # Each turn still hits Claude exactly once (no tool_use → end_turn)
+    assert anthropic_client.messages.create.call_count == 3

@@ -8,14 +8,17 @@ The agent spawns ``pulse.mcp.server`` as a subprocess and talks to it over
 stdio using the MCP Python SDK's client. It does not import the MCP server
 module directly (see ADR-014). The agent itself has no DB dependencies.
 
+Per session:
+  - Fetch the tool catalogue from the MCP server once (in ``chat``), then
+    reuse it for every user turn.
+
 Per turn:
-  1. Fetch the tool catalogue from the MCP server.
-  2. Send the user's question to Claude (claude-sonnet-4-5) along with the
-     tools.
-  3. While Claude returns a ``tool_use`` stop reason, execute every requested
+  1. Send the user's question to Claude (claude-sonnet-4-5) along with the
+     pre-fetched tools.
+  2. While Claude returns a ``tool_use`` stop reason, execute every requested
      tool call via the MCP client, wrap each result in a ``tool_result``
      content block, append it to the conversation, and ask Claude to continue.
-  4. When Claude returns ``end_turn``, surface its final text answer.
+  3. When Claude returns ``end_turn``, surface its final text answer.
 """
 
 from __future__ import annotations
@@ -107,17 +110,17 @@ def _extract_text(call_tool_result: Any) -> str:
 
 async def run_agent_turn(
     user_query: str,
+    tools: list[dict[str, Any]],
     anthropic_client: AsyncAnthropic,
     mcp_client: ClientSession,
 ) -> str:
     """Run a single agent turn: user question in, final text answer out.
 
-    Handles the multi-round tool-use loop. Returns the assistant's final
-    text response once Claude stops requesting tools.
+    Handles the multi-round tool-use loop. ``tools`` is the pre-fetched and
+    pre-converted Anthropic tool catalogue (see ``chat`` for the once-per-
+    session fetch). Returns the assistant's final text response once Claude
+    stops requesting tools.
     """
-    tools_result = await mcp_client.list_tools()
-    tools = [_mcp_tool_to_anthropic_tool(t) for t in tools_result.tools]
-
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_query}]
 
     for _iteration in range(_MAX_ITERATIONS):
@@ -176,7 +179,11 @@ async def run_agent_turn(
 
         messages.append({"role": "user", "content": tool_results})
 
+    # Loop exhausted — fires exactly once, after the for-loop terminates
+    # without an early return. The DEBUG dump of the last message gives
+    # something to work with if this ever trips in production.
     logger.warning("Agent loop hit _MAX_ITERATIONS=%d; aborting", _MAX_ITERATIONS)
+    logger.debug("Last message at iteration limit: %r", messages[-1] if messages else None)
     return "Sorry — I couldn't complete that request within the tool-use limit."
 
 
@@ -194,6 +201,12 @@ async def chat() -> None:
     anthropic_client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     async with mcp_session() as mcp_client:
+        # Fetch the tool catalogue once per session — the server's tool list
+        # is fixed at startup, so refetching every turn is pure overhead.
+        tools_result = await mcp_client.list_tools()
+        tools = [_mcp_tool_to_anthropic_tool(t) for t in tools_result.tools]
+        logger.info("Loaded %d tools from the MCP server", len(tools))
+
         print("Pulse — your GitHub activity assistant. Type 'exit' to quit.")
         while True:
             try:
@@ -204,7 +217,7 @@ async def chat() -> None:
             if not user_query or user_query.lower() in {"exit", "quit"}:
                 break
             try:
-                answer = await run_agent_turn(user_query, anthropic_client, mcp_client)
+                answer = await run_agent_turn(user_query, tools, anthropic_client, mcp_client)
             except Exception:
                 logger.exception("Agent turn failed")
                 print("\nSorry — something went wrong. Check the logs.")
