@@ -201,8 +201,12 @@ def _clamp_limit(raw: object, default: int) -> int:
 
 @_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    # Trace breadcrumbs — useful when the agent subprocess appears to hang.
+    # Each line tells us which await we got past.
+    logger.info("call_tool invoked: name=%s arguments=%s", name, arguments)
     try:
         async with get_session() as session:
+            logger.info("call_tool %s: DB session opened", name)
             if name == "search_activity":
                 limit = _clamp_limit(arguments.get("limit"), 10)
                 result = await tool_search_activity(
@@ -236,6 +240,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 )
             else:
                 raise ValueError(f"Unknown tool: {name!r}")
+        logger.info(
+            "call_tool %s: tool returned %d row(s); serialising response",
+            name,
+            len(result),
+        )
     except NotImplementedError:
         return [
             types.TextContent(

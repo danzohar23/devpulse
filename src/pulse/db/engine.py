@@ -20,7 +20,26 @@ def _async_url(url: str) -> str:
     return url
 
 
-_engine = create_async_engine(_async_url(settings.database_url), echo=False)
+def _connect_args_for(url: str) -> dict[str, object]:
+    """Driver-specific kwargs for create_async_engine's connect_args.
+
+    asyncpg gets a 10-second per-query timeout so a hung Postgres connection
+    surfaces as an error instead of blocking the MCP server (and the agent
+    subprocess that drives it) indefinitely. aiosqlite has no equivalent and
+    rejects unknown kwargs, so SQLite-backed engines (tests, dev) get an
+    empty dict.
+    """
+    if "asyncpg" in url:
+        return {"command_timeout": 10}
+    return {}
+
+
+_async_db_url = _async_url(settings.database_url)
+_engine = create_async_engine(
+    _async_db_url,
+    echo=False,
+    connect_args=_connect_args_for(_async_db_url),
+)
 _SessionFactory: async_sessionmaker[AsyncSession] = async_sessionmaker(
     _engine, expire_on_commit=False
 )
