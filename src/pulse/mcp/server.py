@@ -3,13 +3,21 @@
 Run as: python -m pulse.mcp.server
 
 Tools registered:
-    search_activity  — embed a free-text query and call search_similar
-    get_commits      — recent commits, optional repo filter
+    search_activity   — embed a free-text query and call search_similar
+    get_commits       — recent commits, optional repo filter
     get_pull_requests — recent PRs, optional repo / state filters
-    get_issues       — recent issues, optional repo / state filters
+    get_issues        — recent issues, optional repo / state filters
 
-All tools call the repository layer exclusively; no module outside
-db/repository.py touches the database directly (ADR-001).
+All tools route through the repository layer (ADR-001):
+
+* ``tool_*`` helpers (below) take an ``AsyncSession`` and are exercised directly
+  by the unit-test suite against a SQLite in-memory database.
+
+* ``call_tool`` (the live MCP handler) uses ``get_asyncpg_pool()`` from
+  ``db/engine.py`` and the ``*_asyncpg`` functions from ``db/repository.py``.
+  SQLAlchemy's greenlet bridge deadlocks inside anyio's cancel-scope stack on
+  Windows; the asyncpg path bypasses the bridge without changing the query
+  logic or violating ADR-001.
 """
 
 from __future__ import annotations
@@ -17,17 +25,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 
 import mcp.types as types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from pulse.db.engine import get_session
+from pulse.db.engine import get_asyncpg_pool
 from pulse.db.repository import (
+    get_commits_asyncpg,
+    get_issues_asyncpg,
+    get_pull_requests_asyncpg,
     get_recent_commits,
     get_recent_issues,
     get_recent_pull_requests,
+    search_activity_asyncpg,
     search_similar,
 )
 from pulse.indexing.embedder import embed_texts
@@ -38,9 +51,9 @@ _server = Server("pulse")
 
 
 # ---------------------------------------------------------------------------
-# Business-logic functions — call the repository layer, return list[dict].
-# Defined at module level so tests can call them directly without going
-# through the MCP wire protocol.
+# Business-logic helpers — SQLAlchemy / AsyncSession path.
+# Used directly by the unit-test suite; NOT called from call_tool in
+# production (which uses the asyncpg path via db/repository.py).
 # ---------------------------------------------------------------------------
 
 
@@ -201,50 +214,44 @@ def _clamp_limit(raw: object, default: int) -> int:
 
 @_server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-    # Trace breadcrumbs — useful when the agent subprocess appears to hang.
-    # Each line tells us which await we got past.
     logger.info("call_tool invoked: name=%s arguments=%s", name, arguments)
+
     try:
-        async with get_session() as session:
-            logger.info("call_tool %s: DB session opened", name)
-            if name == "search_activity":
-                limit = _clamp_limit(arguments.get("limit"), 10)
-                result = await tool_search_activity(
-                    session,
-                    query=arguments["query"],
-                    repo=arguments.get("repo"),
-                    limit=limit,
-                )
-            elif name == "get_commits":
-                limit = _clamp_limit(arguments.get("limit"), 50)
-                result = await tool_get_commits(
-                    session,
-                    repo=arguments.get("repo"),
-                    limit=limit,
-                )
-            elif name == "get_pull_requests":
-                limit = _clamp_limit(arguments.get("limit"), 50)
-                result = await tool_get_pull_requests(
-                    session,
-                    repo=arguments.get("repo"),
-                    state=arguments.get("state"),
-                    limit=limit,
-                )
-            elif name == "get_issues":
-                limit = _clamp_limit(arguments.get("limit"), 50)
-                result = await tool_get_issues(
-                    session,
-                    repo=arguments.get("repo"),
-                    state=arguments.get("state"),
-                    limit=limit,
-                )
-            else:
-                raise ValueError(f"Unknown tool: {name!r}")
-        logger.info(
-            "call_tool %s: tool returned %d row(s); serialising response",
-            name,
-            len(result),
-        )
+        pool = await get_asyncpg_pool()
+
+        if name == "search_activity":
+            limit = _clamp_limit(arguments.get("limit"), 10)
+            query = arguments["query"]
+            repo = arguments.get("repo")
+            loop = asyncio.get_running_loop()
+            embeddings = await loop.run_in_executor(None, embed_texts, [query])
+            result = await search_activity_asyncpg(
+                pool, embeddings[0], repo=repo, limit=limit
+            )
+        elif name == "get_commits":
+            limit = _clamp_limit(arguments.get("limit"), 50)
+            result = await get_commits_asyncpg(
+                pool, repo=arguments.get("repo"), limit=limit
+            )
+        elif name == "get_pull_requests":
+            limit = _clamp_limit(arguments.get("limit"), 50)
+            result = await get_pull_requests_asyncpg(
+                pool,
+                repo=arguments.get("repo"),
+                state=arguments.get("state"),
+                limit=limit,
+            )
+        elif name == "get_issues":
+            limit = _clamp_limit(arguments.get("limit"), 50)
+            result = await get_issues_asyncpg(
+                pool,
+                repo=arguments.get("repo"),
+                state=arguments.get("state"),
+                limit=limit,
+            )
+        else:
+            raise ValueError(f"Unknown tool: {name!r}")
+
     except NotImplementedError:
         return [
             types.TextContent(
@@ -256,6 +263,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         logger.exception("Unhandled error in call_tool for %r", name)
         return [types.TextContent(type="text", text="Error: internal server error")]
 
+    logger.info("call_tool %s: returning %d row(s)", name, len(result))
     return [types.TextContent(type="text", text=json.dumps(result))]
 
 
@@ -265,6 +273,14 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 
 async def _run() -> None:
+    # force=True removes any handlers added at import time (e.g. by openai /
+    # sqlalchemy), ensuring basicConfig always takes effect.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
     async with stdio_server() as (read_stream, write_stream):
         await _server.run(
             read_stream,
@@ -274,4 +290,9 @@ async def _run() -> None:
 
 
 if __name__ == "__main__":
+    # SQLAlchemy's greenlet bridge is incompatible with Windows' default
+    # ProactorEventLoop.  The MCP server never spawns subprocesses, so
+    # SelectorEventLoop is a safe alternative.
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(_run())

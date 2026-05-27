@@ -338,30 +338,23 @@ async def test_tool_search_activity_returns_dicts(db_session: AsyncSession) -> N
 
 
 @pytest.mark.asyncio
-async def test_call_tool_returns_error_text_on_not_implemented(
-    db_session: AsyncSession,
-) -> None:
-    """call_tool catches NotImplementedError from search_similar and returns an error TextContent.
+async def test_call_tool_returns_error_text_on_not_implemented() -> None:
+    """call_tool catches NotImplementedError from search_activity_asyncpg and returns an error TextContent.
 
-    This exercises the pgvector-unavailable path that real callers would hit on
-    a non-PostgreSQL backend (ADR-013).
+    This exercises the pgvector-unavailable path that real callers would hit when
+    pgvector is not installed on the PostgreSQL server (ADR-013).
     """
-    from contextlib import asynccontextmanager
-    from typing import Any
+    from unittest.mock import MagicMock
 
-    def make_ctx() -> Any:
-        @asynccontextmanager
-        async def _ctx():  # type: ignore[return]
-            yield db_session
-        return _ctx()
+    mock_pool = MagicMock()
 
     with (
-        patch("pulse.mcp.server.get_session", side_effect=make_ctx),
         patch("pulse.mcp.server.embed_texts", return_value=[_FAKE_VEC]),
+        patch("pulse.mcp.server.get_asyncpg_pool", new_callable=AsyncMock, return_value=mock_pool),
         patch(
-            "pulse.mcp.server.search_similar",
+            "pulse.mcp.server.search_activity_asyncpg",
             new_callable=AsyncMock,
-            side_effect=NotImplementedError("search_similar requires PostgreSQL"),
+            side_effect=NotImplementedError("search_activity requires PostgreSQL with pgvector"),
         ),
     ):
         response = await call_tool("search_activity", {"query": "test"})

@@ -4,6 +4,7 @@ import importlib.resources
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+import asyncpg
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from pulse.config import settings
@@ -30,7 +31,7 @@ def _connect_args_for(url: str) -> dict[str, object]:
     empty dict.
     """
     if "asyncpg" in url:
-        return {"command_timeout": 10}
+        return {"command_timeout": 10, "timeout": 10}
     return {}
 
 
@@ -43,6 +44,33 @@ _engine = create_async_engine(
 _SessionFactory: async_sessionmaker[AsyncSession] = async_sessionmaker(
     _engine, expire_on_commit=False
 )
+
+
+_asyncpg_pool: asyncpg.Pool | None = None
+
+
+async def get_asyncpg_pool() -> asyncpg.Pool:
+    """Return the module-level asyncpg connection pool, creating it on first call.
+
+    Used by the MCP server's ``call_tool`` handler as a direct-asyncpg
+    alternative to ``get_session()``.  SQLAlchemy's greenlet bridge deadlocks
+    inside anyio cancel scopes on Windows; bypassing it with asyncpg restores
+    normal async execution without touching the query logic in repository.py.
+    """
+    global _asyncpg_pool
+    if _asyncpg_pool is None:
+        dsn = (
+            settings.database_url
+            .replace("postgresql+asyncpg://", "postgresql://")
+            .replace("postgresql+psycopg2://", "postgresql://")
+        )
+        _asyncpg_pool = await asyncpg.create_pool(
+            dsn,
+            min_size=1,
+            max_size=5,
+            command_timeout=10.0,
+        )
+    return _asyncpg_pool
 
 
 @asynccontextmanager

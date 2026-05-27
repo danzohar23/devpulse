@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import asyncpg
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -431,4 +432,192 @@ async def search_similar(
             )
 
     results.sort(key=lambda x: x.score, reverse=True)
+    return results[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Direct-asyncpg queries — MCP server production path
+#
+# SQLAlchemy's greenlet bridge (greenlet_spawn) deadlocks inside anyio's
+# cancel-scope stack on Windows, so the MCP server's call_tool handler cannot
+# use get_session()-based queries.  These functions use asyncpg directly and
+# avoid the greenlet bridge entirely.  The SQLAlchemy functions above remain
+# the path for the test suite (SQLite in-memory) and all non-MCP callers.
+# ---------------------------------------------------------------------------
+
+
+def _dt(v: object) -> str | None:
+    """Serialise a datetime (or None) to an ISO-8601 string."""
+    return v.isoformat() if v is not None else None  # type: ignore[union-attr]
+
+
+async def get_commits_asyncpg(
+    pool: asyncpg.Pool,
+    repo: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return recent commits via a direct asyncpg query."""
+    async with pool.acquire() as conn:
+        if repo is not None:
+            rows = await conn.fetch(
+                "SELECT sha, repo, message, author_name, author_email, timestamp, url"
+                " FROM commits WHERE repo = $1 ORDER BY timestamp DESC LIMIT $2",
+                repo,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT sha, repo, message, author_name, author_email, timestamp, url"
+                " FROM commits ORDER BY timestamp DESC LIMIT $1",
+                limit,
+            )
+    return [
+        {
+            "sha": r["sha"],
+            "repo": r["repo"],
+            "message": r["message"],
+            "author_name": r["author_name"],
+            "author_email": r["author_email"],
+            "timestamp": _dt(r["timestamp"]),
+            "url": r["url"],
+        }
+        for r in rows
+    ]
+
+
+async def get_pull_requests_asyncpg(
+    pool: asyncpg.Pool,
+    repo: str | None = None,
+    state: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return recent pull requests via a direct asyncpg query."""
+    conditions: list[str] = []
+    params: list = []
+    if repo is not None:
+        params.append(repo)
+        conditions.append(f"repo = ${len(params)}")
+    if state is not None:
+        params.append(state)
+        conditions.append(f"state = ${len(params)}")
+    params.append(limit)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT pr_id, repo, title, body, state, merged_at, created_at, url"
+            f" FROM pull_requests {where} ORDER BY created_at DESC LIMIT ${len(params)}",
+            *params,
+        )
+    return [
+        {
+            "pr_id": r["pr_id"],
+            "repo": r["repo"],
+            "title": r["title"],
+            "body": r["body"],
+            "state": r["state"],
+            "merged_at": _dt(r["merged_at"]),
+            "created_at": _dt(r["created_at"]),
+            "url": r["url"],
+        }
+        for r in rows
+    ]
+
+
+async def get_issues_asyncpg(
+    pool: asyncpg.Pool,
+    repo: str | None = None,
+    state: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return recent issues via a direct asyncpg query."""
+    conditions: list[str] = []
+    params: list = []
+    if repo is not None:
+        params.append(repo)
+        conditions.append(f"repo = ${len(params)}")
+    if state is not None:
+        params.append(state)
+        conditions.append(f"state = ${len(params)}")
+    params.append(limit)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT issue_id, repo, title, body, state, created_at, closed_at, url"
+            f" FROM issues {where} ORDER BY created_at DESC LIMIT ${len(params)}",
+            *params,
+        )
+    return [
+        {
+            "issue_id": r["issue_id"],
+            "repo": r["repo"],
+            "title": r["title"],
+            "body": r["body"],
+            "state": r["state"],
+            "created_at": _dt(r["created_at"]),
+            "closed_at": _dt(r["closed_at"]),
+            "url": r["url"],
+        }
+        for r in rows
+    ]
+
+
+async def search_activity_asyncpg(
+    pool: asyncpg.Pool,
+    embedding: list[float],
+    repo: str | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """Semantic similarity search via direct asyncpg (mirrors search_similar).
+
+    Raises NotImplementedError when pgvector is not installed on the server.
+    """
+    vec = "[" + ",".join(str(x) for x in embedding) + "]"
+    repo_filter = "AND repo = $3" if repo is not None else ""
+
+    results: list[dict] = []
+    async with pool.acquire() as conn:
+        for row_type, tbl, title_col, body_expr, state_expr, ts_col in [
+            ("commit",       "commits",       "message", "NULL::text", "NULL::text", "timestamp"),
+            ("pull_request", "pull_requests", "title",   "body",       "state",      "created_at"),
+            ("issue",        "issues",        "title",   "body",       "state",      "created_at"),
+        ]:
+            params: list = [vec, limit]
+            if repo is not None:
+                params.append(repo)
+            try:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT '{row_type}'::text AS type,
+                           1 - (embedding <=> CAST($1 AS vector)) AS score,
+                           repo, url,
+                           {title_col} AS title,
+                           {body_expr} AS body,
+                           {state_expr} AS state,
+                           {ts_col} AS created_at
+                    FROM   {tbl}
+                    WHERE  embedding IS NOT NULL {repo_filter}
+                    ORDER BY embedding <=> CAST($1 AS vector)
+                    LIMIT $2
+                    """,
+                    *params,
+                )
+            except asyncpg.UndefinedObjectError:
+                raise NotImplementedError(
+                    "search_activity requires PostgreSQL with pgvector"
+                )
+            for r in rows:
+                results.append(
+                    {
+                        "type": r["type"],
+                        "score": float(r["score"]),
+                        "repo": r["repo"],
+                        "url": r["url"],
+                        "title": r["title"],
+                        "body": r["body"],
+                        "state": r["state"],
+                        "created_at": _dt(r["created_at"]),
+                    }
+                )
+
+    results.sort(key=lambda x: x["score"], reverse=True)
     return results[:limit]
